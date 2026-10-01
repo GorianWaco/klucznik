@@ -18,7 +18,10 @@ Bez fizycznego klucza plik sejfu jest bezużyteczny.
 
 ## Instalacja
 
+Sejf (`~/.local/share/klucznik/vault.enc`) zostaje na tym komputerze. W repozytorium jest tylko program.
+
 ```bash
+git clone https://github.com/GorianWaco/klucznik.git ~/Projekty/klucznik
 cd ~/Projekty/klucznik
 ./install.sh
 klucznik

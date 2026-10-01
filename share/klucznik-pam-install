@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Root helper: FIDO2 (tap) zamiast hasła — GDM, sudo, polkit.
+# ExcelSecu ma interfejs klawiatury, który wpisuje śmieci w pole hasła — wyłączamy go.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Ten skrypt musi iść przez pkexec/sudo." >&2
+  exit 1
+fi
+
+ACTION="${1:-}"
+MARKER="# klucznik-fido2"
+UDEV_RULE="/etc/udev/rules.d/71-klucznik-fido-nokeyboard.rules"
+
+install_pkgs() {
+  if [[ -f /usr/lib/security/pam_u2f.so ]]; then
+    return 0
+  fi
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -S --needed --noconfirm pam-u2f libfido2
+  else
+    echo "Zainstaluj ręcznie pam-u2f i libfido2." >&2
+    exit 1
+  fi
+}
+
+pam_u2f_line() {
+  local authfile="$1"
+  # origin = RP ID z rejestracji Klucznika (localhost), nie https://localhost
+  printf 'auth       sufficient    pam_u2f.so authfile=%s origin=localhost appid=localhost cue userpresence=1 pinverification=0 userverification=0\n' "$authfile"
+}
+
+replace_or_insert() {
+  local file="$1"
+  local line="$2"
+  local backup_dir="$3"
+  [[ -f "$file" ]] || return 0
+  mkdir -p "$backup_dir"
+  if [[ ! -f "$backup_dir/$(basename "$file")" ]]; then
+    cp -a "$file" "$backup_dir/$(basename "$file")"
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  if grep -q 'pam_u2f.so' "$file"; then
+    awk -v line="$line" -v marker="$MARKER" '
+      $0 == marker { print; getline; print line; next }
+      /pam_u2f[.]so/ { print marker; print line; next }
+      { print }
+    ' "$file" > "$tmp"
+  else
+    awk -v line="$line" -v marker="$MARKER" '
+      BEGIN { done=0 }
+      NR==1 {
+        print
+        if ($0 ~ /^#%PAM/) { print marker; print line; done=1 }
+        next
+      }
+      { print }
+      END { if (!done) { print marker; print line } }
+    ' "$file" > "$tmp"
+  fi
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+  mv "$tmp" "$file"
+  echo "PAM FIDO2: $file"
+}
+
+ensure_polkit() {
+  local dest=/etc/pam.d/polkit-1
+  if [[ ! -f "$dest" ]]; then
+    if [[ -f /usr/lib/pam.d/polkit-1 ]]; then
+      cp -a /usr/lib/pam.d/polkit-1 "$dest"
+    else
+      cat > "$dest" <<'EOF'
+#%PAM-1.0
+
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    include      system-auth
+EOF
+      chmod 644 "$dest"
+    fi
+    echo "utworzono $dest"
+  fi
+}
+
+install_udev() {
+  cat > "$UDEV_RULE" <<'EOF'
+# ExcelSecu FIDO2 (1ea8:fc25) udaje klawiaturę i wpisuje OTP/hasło w pole logowania.
+# Zostawiamy interfejs FIDO (hidraw), ukrywamy input/keyboard przed libinput.
+ACTION=="add|change", SUBSYSTEM=="input", ATTRS{idVendor}=="1ea8", ATTRS{idProduct}=="fc25", ENV{ID_INPUT_KEYBOARD}="0", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+EOF
+  chmod 644 "$UDEV_RULE"
+  udevadm control --reload-rules || true
+  udevadm trigger --subsystem-match=input --action=change || true
+  # od razu odepniij sterownik klawiatury HID (interface 0)
+  local hid
+  for hid in /sys/bus/hid/devices/0003:1EA8:FC25.*; do
+    [[ -e "$hid" ]] || continue
+    local phys
+    phys="$(cat "$hid/uevent" 2>/dev/null | sed -n 's/^HID_PHYS=//p')"
+    if [[ "$phys" == *"/input0" ]]; then
+      local name
+      name="$(basename "$hid")"
+      if [[ -e /sys/bus/hid/drivers/hid-generic/unbind ]]; then
+        echo -n "$name" > /sys/bus/hid/drivers/hid-generic/unbind 2>/dev/null || true
+        echo "wyłączono klawiaturę HID: $name"
+      fi
+    fi
+  done
+}
+
+revert_file() {
+  local backup_dir="$1"
+  local dest="$2"
+  local name
+  name="$(basename "$dest")"
+  local src="$backup_dir/$name"
+  if [[ -f "$src" ]]; then
+    cp -a "$src" "$dest"
+    echo "przywrócono $dest"
+    return
+  fi
+  if [[ -f "$dest" ]] && grep -q "$MARKER" "$dest"; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v marker="$MARKER" '
+      $0 == marker { skip=1; next }
+      skip==1 && /pam_u2f[.]so/ { skip=0; next }
+      { print }
+    ' "$dest" > "$tmp"
+    chmod --reference="$dest" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    mv "$tmp" "$dest"
+    echo "wycięto Klucznik z $dest"
+  fi
+}
+
+case "$ACTION" in
+  apply)
+    AUTHFILE="${2:?brak u2f_keys}"
+    USERNAME="${3:?brak user}"
+    BACKUP="${4:?brak katalogu kopii}"
+    [[ -f "$AUTHFILE" ]] || { echo "Brak $AUTHFILE — najpierw rejestracja klucza."; exit 1; }
+    install_pkgs
+    LINE="$(pam_u2f_line "$AUTHFILE")"
+    mkdir -p "$BACKUP"
+    chown "$USERNAME:" "$BACKUP" 2>/dev/null || true
+    ensure_polkit
+    replace_or_insert /etc/pam.d/gdm-password "$LINE" "$BACKUP"
+    replace_or_insert /etc/pam.d/sudo "$LINE" "$BACKUP"
+    replace_or_insert /etc/pam.d/polkit-1 "$LINE" "$BACKUP"
+    install_udev
+    echo "OK. Tapnij klucz FIDO2 — bez wpisywania hasła."
+    echo "Hasło uniksowe zostaje jako zapas, gdy klucza nie ma w USB."
+    ;;
+  revert)
+    BACKUP="${2:?brak katalogu kopii}"
+    revert_file "$BACKUP" /etc/pam.d/gdm-password
+    revert_file "$BACKUP" /etc/pam.d/sudo
+    revert_file "$BACKUP" /etc/pam.d/polkit-1
+    rm -f "$UDEV_RULE"
+    udevadm control --reload-rules || true
+    echo "OK. Przywrócono hasła PAM."
+    ;;
+  *)
+    echo "Użycie: $0 apply AUTHFILE USER BACKUP | revert BACKUP" >&2
+    exit 2
+    ;;
+esac

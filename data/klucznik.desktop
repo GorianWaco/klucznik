@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Klucznik
+Name[pl]=Klucznik
+GenericName=FIDO2 password vault
+GenericName[pl]=Sejf haseł FIDO2
+Comment=Log in and unlock passwords by tapping a FIDO2 USB key
+Comment[pl]=Logowanie i hasła przez tapnięcie klucza FIDO2 na USB
+Exec=klucznik
+Icon=klucznik
+Terminal=false
+Categories=Settings;Security;Utility;
+Keywords=FIDO2;U2F;YubiKey;hasło;login;klucz;pam;
+StartupNotify=true
+StartupWMClass=pl.gorian.Klucznik
